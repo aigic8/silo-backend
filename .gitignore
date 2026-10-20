@@ -1,0 +1,10 @@
+# Rust build artifacts
+/target
+
+# Local environment / secrets
+.env
+.env.*
+!.env.example
+
+# Tooling scratch
+.pi/
