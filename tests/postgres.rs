@@ -470,6 +470,26 @@ async fn websocket_origin_guard(pool: &PgPool) {
         .await
         .expect("in-memory response");
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    // A non-websocket GET with a valid cookie gets the JSON error envelope
+    // instead of axum's default text rejection.
+    let (cookie, _) = register_user(
+        &app,
+        "alice@example.com",
+        &b64(&[7u8; 32]),
+        &b64(&[9u8; 16]),
+    )
+    .await;
+    let response = app
+        .clone()
+        .oneshot(get_request("/api/events", Some(&cookie), Some(ORIGIN)))
+        .await
+        .expect("in-memory response");
+    assert_eq!(response.status(), StatusCode::UPGRADE_REQUIRED);
+    assert_eq!(
+        body_json(response).await["error"],
+        "WebSocket upgrade required"
+    );
 }
 
 async fn websocket_events_scoped_to_user(pool: &PgPool) {

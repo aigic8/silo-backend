@@ -60,7 +60,8 @@ pub fn build_router(state: AppState) -> Router {
             state.clone(),
             middleware::origin_guard,
         ))
-        .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES));
+        .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES))
+        .layer(axum::middleware::from_fn(middleware::no_store_guard));
 
     Router::new().nest("/api", api).with_state(state)
 }
@@ -132,6 +133,20 @@ mod tests {
             .expect("in-memory response");
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::VARY)
+                .and_then(|value| value.to_str().ok()),
+            Some("Cookie")
+        );
         let bytes = axum::body::to_bytes(response.into_body(), 1024)
             .await
             .expect("body");

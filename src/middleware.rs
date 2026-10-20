@@ -40,6 +40,20 @@ pub async fn ws_origin_guard(State(state): State<AppState>, req: Request, next: 
     next.run(req).await
 }
 
+/// Prevent browser and intermediary caches from retaining API responses that
+/// vary by the session cookie. Applies to every `/api` response, including
+/// JSON errors produced by inner middleware and extractors.
+pub async fn no_store_guard(req: Request, next: Next) -> Response {
+    let mut response = next.run(req).await;
+    let no_store = axum::http::HeaderValue::from_static("no-store");
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, no_store);
+    let vary_cookie = axum::http::HeaderValue::from_static("Cookie");
+    response.headers_mut().insert(header::VARY, vary_cookie);
+    response
+}
+
 fn is_mutation(method: &Method) -> bool {
     method == Method::POST
         || method == Method::PUT

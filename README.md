@@ -19,7 +19,7 @@ and stored only as SHA-256 hashes.
 | GET    | `/api/auth/salt`    | 200     | `?email=...` → `{salt}` (401 when unknown) |
 | POST   | `/api/auth/login`   | 200     | `{email,auth_key}` → user + session cookie |
 | GET    | `/api/auth/me`      | 200     | `{id,email,salt}` for the session |
-| POST   | `/api/auth/logout`  | 204     | Deletes session and clears cookie |
+| POST   | `/api/auth/logout`  | 204     | Deletes session and clears cookie (500 if delete fails) |
 | GET    | `/api/vault`        | 200     | `{version,ciphertext,nonce}` (empty = `version:0`, nulls) |
 | PUT    | `/api/vault`        | 200     | `{expected_version,ciphertext,nonce}` → `{version}`; 409 on CAS conflict |
 | GET    | `/api/events`       | 101     | Authenticated websocket; sends `{"type":"vault_changed","version":N}` |
@@ -40,6 +40,7 @@ docker compose up --build
 
 The app listens on `http://127.0.0.1:3000` and the database on
 `localhost:5432` (host ports are configurable via `APP_PORT`/`POSTGRES_PORT`).
+Both published dev ports bind only to `127.0.0.1`, never all host interfaces.
 Migrations are applied automatically when the app starts. `curl -fsS
 http://127.0.0.1:3000/api/health` should return `{"status":"ok"}`.
 
@@ -88,8 +89,13 @@ and no permissive CORS layer is enabled.
   salt; the raw auth key is never stored.
 - **Sessions.** Session tokens are 32 random bytes, sent only as an
   `HttpOnly; SameSite=Strict; Path=/api` cookie (plus `Secure` in production),
-  and stored only as SHA-256 hashes. Logout deletes the session row and clears
-  the cookie.
+  and stored only as SHA-256 hashes. Logout deletes the session row and only
+  clears the cookie after that delete succeeds; a failed delete returns 500 so
+  a captured token is not falsely reported as revoked. Expired rows are cleaned
+  at startup and opportunistically on login.
+- **No caching of API responses.** Every `/api` response carries
+  `Cache-Control: no-store` and `Vary: Cookie` so browser and intermediary
+  caches do not retain email/salt metadata or opaque vault bytes after logout.
 - **Origin / CSRF.** State-changing requests with an `Origin` header must match
   `ALLOWED_ORIGIN`. Websocket upgrades always require the allowed `Origin`.
   There is no wildcard CORS with credentials.
@@ -99,20 +105,24 @@ and no permissive CORS layer is enabled.
   committed value.
 - **Invalidations.** After a successful CAS write, only websockets belonging to
   the same user receive `vault_changed`. The message contains a version number,
-  never plaintext or ciphertext.
+  never plaintext or ciphertext. Each socket has a bounded outbound queue; a
+  slow or stalled subscriber is dropped and reconnects rather than allowing
+  unbounded server memory growth.
 - **Failure handling.** Base64/nonce/salt/auth-key lengths are validated before
   any DB write. Decoded ciphertext is capped at 8 MiB; the HTTP body limit is
   16 MiB to accommodate padded base64 and the JSON envelope.
 
 ## Metadata and deployment limitations
 
-- **Account enumeration.** `GET /api/auth/salt` returns 200 for an existing
-  account and 401 otherwise. This is inherent to the contract and reveals
-  whether an email is registered. Deployments **must** place an external rate
-  limiter (reverse proxy/WAF) in front of this endpoint; the MVP does not
-  implement one internally. Login responses are deliberately generic, and the
-  unknown-account path performs a dummy Argon2 hash to reduce timing
-  side-channel leakage.
+- **Account enumeration and email verification.** `GET /api/auth/salt` returns
+  200 for an existing account and 401 otherwise, and `POST /api/auth/register`
+  returns a distinct 409 for an already-registered email. Both reveal whether
+  an email is registered. The MVP has **no email ownership verification**, so
+  registration is also an identifier-squatting surface. Deployments **must**
+  place an external rate limiter (reverse proxy/WAF) in front of auth/salt
+  endpoints and, outside the MVP, should add ownership verification. Login
+  responses are deliberately generic, and the unknown-account path performs a
+  dummy Argon2 hash to reduce timing side-channel leakage.
 - **Single-instance broadcasts.** Vault invalidations are delivered through an
   in-process hub. Running more than one backend replica requires an external
   fan-out (for example Redis pub/sub); without it a write on replica A will
@@ -122,6 +132,11 @@ and no permissive CORS layer is enabled.
   clients present an explicit conflict choice rather than auto-merging.
 - **No audit claim.** This MVP does not provide tamper-evident or write-once
   audit logging for vault history.
+- **Dev compose credentials are development-only.** `docker-compose.yml`
+  publishes its ports on `127.0.0.1` and uses the default `silo/silo`
+  credentials strictly for local development. Production must provision its own
+  secrets externally (for example a secrets manager or operator-managed
+  environment); do not reuse these defaults outside localhost.
 
 ## Threat model (E2E)
 

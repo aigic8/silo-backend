@@ -1,12 +1,15 @@
+use axum::extract::ws::rejection::WebSocketUpgradeRejection;
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{State, WebSocketUpgrade};
+use axum::http::StatusCode;
 use axum::response::Response;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::mpsc::{channel, Receiver, Sender};
 use uuid::Uuid;
 
 use crate::{ApiError, AppState, AuthUser};
@@ -17,6 +20,11 @@ use crate::{ApiError, AppState, AuthUser};
 /// "revalidate expiry/logout for long-lived sockets or limit lifetime"
 /// requirement without a separate per-socket session poll.
 pub const WS_MAX_LIFETIME: Duration = Duration::from_secs(30 * 60);
+
+/// Per-socket outbound queue capacity. A subscriber that stops reading is
+/// dropped once its queue fills; the client sees the socket close, reconnects
+/// and fetches the latest vault instead of allowing unbounded memory growth.
+pub const SUBSCRIBER_CHANNEL_CAPACITY: usize = 64;
 
 /// Server-to-client event. Only invalidation metadata is sent: version number,
 /// never plaintext or ciphertext.
@@ -37,7 +45,7 @@ pub struct EventHub {
 
 #[derive(Default)]
 struct EventHubInner {
-    subscribers: Mutex<HashMap<Uuid, HashMap<u64, UnboundedSender<ServerEvent>>>>,
+    subscribers: Mutex<HashMap<Uuid, HashMap<u64, Sender<ServerEvent>>>>,
     next_id: AtomicU64,
 }
 
@@ -49,8 +57,8 @@ impl EventHub {
     /// Register a socket for a user. Returns the subscription id and the
     /// receiver end. The id must be passed back to [`Self::unsubscribe`] when
     /// the socket closes.
-    pub fn subscribe(&self, user_id: Uuid) -> (u64, UnboundedReceiver<ServerEvent>) {
-        let (sender, receiver) = unbounded_channel();
+    pub fn subscribe(&self, user_id: Uuid) -> (u64, Receiver<ServerEvent>) {
+        let (sender, receiver) = channel(SUBSCRIBER_CHANNEL_CAPACITY);
         let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
 
         let mut subscribers = self.inner.subscribers.lock().expect("event hub poisoned");
@@ -73,24 +81,34 @@ impl EventHub {
 
     /// Publish a `vault_changed` invalidation to every socket belonging to the
     /// given user. Sockets belonging to any other user are never contacted.
+    ///
+    /// Sends are non-blocking (`try_send`). A disconnected subscriber or one
+    /// whose bounded queue is full is removed and its channel closed; the
+    /// associated socket loop observes the closure and exits rather than
+    /// hanging on a slow peer.
     pub fn publish_vault_changed(&self, user_id: Uuid, version: i64) {
-        let senders: Vec<UnboundedSender<ServerEvent>> = {
-            let subscribers = self.inner.subscribers.lock().expect("event hub poisoned");
-            subscribers
-                .get(&user_id)
-                .map(|user_subscriptions| user_subscriptions.values().cloned().collect())
-                .unwrap_or_default()
+        let event = ServerEvent::VaultChanged { version };
+
+        let mut subscribers = self.inner.subscribers.lock().expect("event hub poisoned");
+        let Some(user_subscriptions) = subscribers.get_mut(&user_id) else {
+            return;
         };
 
-        if senders.is_empty() {
-            return;
+        let mut dropped = Vec::new();
+        for (&subscription_id, sender) in user_subscriptions.iter() {
+            match sender.try_send(event.clone()) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) | Err(TrySendError::Closed(_)) => {
+                    dropped.push(subscription_id);
+                }
+            }
         }
 
-        let event = ServerEvent::VaultChanged { version };
-        for sender in senders {
-            // The receiver is removed from the map when its socket drops;
-            // a send failure here simply means that cleanup won the race.
-            let _ = sender.send(event.clone());
+        for subscription_id in dropped {
+            user_subscriptions.remove(&subscription_id);
+        }
+        if user_subscriptions.is_empty() {
+            subscribers.remove(&user_id);
         }
     }
 }
@@ -101,8 +119,10 @@ impl EventHub {
 pub async fn events_ws(
     State(state): State<AppState>,
     user: AuthUser,
-    ws: WebSocketUpgrade,
+    ws: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
 ) -> Result<Response, ApiError> {
+    let ws =
+        ws.map_err(|_| ApiError::new(StatusCode::UPGRADE_REQUIRED, "WebSocket upgrade required"))?;
     Ok(ws.on_upgrade(move |socket| handle_socket(socket, state, user.user_id)))
 }
 
@@ -181,5 +201,27 @@ mod tests {
 
         hub.publish_vault_changed(user_id, 2);
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn slow_subscriber_is_dropped_when_queue_overflows() {
+        let hub = EventHub::new();
+        let user_id = Uuid::new_v4();
+        let (id, mut rx) = hub.subscribe(user_id);
+
+        for version in 1..=(SUBSCRIBER_CHANNEL_CAPACITY as i64 + 1) {
+            hub.publish_vault_changed(user_id, version);
+        }
+
+        // The channel is bounded, so the overflow publish drops the
+        // subscriber and closes the receiver rather than growing without
+        // bound. Drain the queued events, then observe closure.
+        for _ in 0..SUBSCRIBER_CHANNEL_CAPACITY {
+            assert!(rx.recv().await.is_some());
+        }
+        assert_eq!(rx.recv().await, None);
+
+        // Cleanup is idempotent after the hub already removed the subscriber.
+        hub.unsubscribe(user_id, id);
     }
 }

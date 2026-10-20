@@ -1,3 +1,4 @@
+use silo_backend::auth::cleanup_expired_sessions;
 use silo_backend::{build_router, run_migrations, AppConfig, AppState, EventHub};
 use sqlx::postgres::PgPoolOptions;
 use std::net::SocketAddr;
@@ -27,6 +28,10 @@ async fn main() {
     run_migrations(&pool)
         .await
         .expect("failed to run migrations");
+
+    if let Err(error) = cleanup_expired_sessions(&pool).await {
+        tracing::warn!(error = %error, "failed to clean expired sessions");
+    }
 
     let app = build_router(AppState {
         db: pool,

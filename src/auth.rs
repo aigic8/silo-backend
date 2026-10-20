@@ -223,6 +223,7 @@ pub async fn login(
         return Err(ApiError::invalid_login());
     }
 
+    delete_expired_sessions_for_user(&state.db, user_id).await?;
     let session_token = create_session(&state.db, user_id, state.config.session_ttl_hours).await?;
     let cookie = session_cookie_header(&session_token, &state.config);
 
@@ -250,15 +251,17 @@ pub async fn me(user: AuthUser) -> Result<Response, ApiError> {
         .into_response())
 }
 
-/// `POST /api/auth/logout`. Always clears the cookie; if a session token was
-/// present it is deleted from the database.
-pub async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
+/// `POST /api/auth/logout`. Revokes the presented session when one exists and
+/// clears the cookie only after the database delete has succeeded. A delete
+/// failure returns 500 and leaves the cookie in place so a captured token is
+/// not falsely reported as revoked.
+pub async fn logout(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
     if let Some(token) = session_token_from_headers(&headers) {
         let token_hash = hash_session_token(&token);
-        let _ = sqlx::query("DELETE FROM sessions WHERE token_hash = $1")
-            .bind(&token_hash[..])
-            .execute(&state.db)
-            .await;
+        revoke_session(&state.db, &token_hash).await?;
     }
 
     let mut response_headers = HeaderMap::new();
@@ -266,7 +269,34 @@ pub async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Respon
         response_headers.insert(header::SET_COOKIE, value);
     }
 
-    (StatusCode::NO_CONTENT, response_headers).into_response()
+    Ok((StatusCode::NO_CONTENT, response_headers).into_response())
+}
+
+/// Delete expired session rows. Called once at startup and per successful
+/// login so stale rows are bounded without a background worker.
+pub async fn cleanup_expired_sessions(pool: &PgPool) -> Result<u64, sqlx::Error> {
+    sqlx::query("DELETE FROM sessions WHERE expires_at <= now()")
+        .execute(pool)
+        .await
+        .map(|result| result.rows_affected())
+}
+
+async fn revoke_session(pool: &PgPool, token_hash: &[u8]) -> Result<(), ApiError> {
+    sqlx::query("DELETE FROM sessions WHERE token_hash = $1")
+        .bind(token_hash)
+        .execute(pool)
+        .await
+        .map_err(|_| ApiError::internal())?;
+    Ok(())
+}
+
+async fn delete_expired_sessions_for_user(pool: &PgPool, user_id: Uuid) -> Result<(), ApiError> {
+    sqlx::query("DELETE FROM sessions WHERE user_id = $1 AND expires_at <= now()")
+        .bind(user_id)
+        .execute(pool)
+        .await
+        .map_err(|_| ApiError::internal())?;
+    Ok(())
 }
 
 fn auth_response(status: StatusCode, body: AuthResponse, cookie: String) -> Response {
@@ -369,6 +399,36 @@ fn is_unique_violation(error: &sqlx::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::events::EventHub;
+    use sqlx::postgres::PgPoolOptions;
+
+    #[tokio::test]
+    async fn logout_returns_500_and_keeps_cookie_when_revoke_fails() {
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgres://silo:silo@127.0.0.1:1/silo")
+            .expect("lazy pool without connection");
+        // A closed pool fails the DELETE immediately instead of contacting a
+        // shared database or waiting on an unreachable TCP endpoint.
+        pool.close().await;
+
+        let state = AppState {
+            db: pool,
+            config: AppConfig::default(),
+            events: EventHub::new(),
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            HeaderValue::from_static("silo_session=opaque-token"),
+        );
+
+        let error = logout(State(state), headers)
+            .await
+            .expect_err("closed pool must make DELETE fail");
+        let response = error.into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(response.headers().get(header::SET_COOKIE).is_none());
+    }
 
     #[test]
     fn session_token_hash_is_stable_sha256() {
